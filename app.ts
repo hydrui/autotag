@@ -1,8 +1,8 @@
 import { InferenceSession, Tensor } from "onnxruntime-web";
 
-const modelPath = "/model/wd-v1-4-vit-tagger-v2/model.ort";
 const modelInfoPath = "/model/wd-v1-4-vit-tagger-v2/info.json";
-const modelTagPath = "/model/wd-v1-4-vit-tagger-v2/selected_tags.csv";
+let modelPath = "";
+let modelTagPath = "";
 
 const imageInput = getElementByIdOrDie("imageInput", HTMLInputElement);
 const uploadArea = getElementByIdOrDie("uploadArea", HTMLDivElement);
@@ -36,10 +36,19 @@ function parseCSV(text: string): Record<string, string>[] {
   return data;
 }
 
+function relativePath(urlString: URL | string, path: string): URL {
+  return new URL(path, new URL(urlString, document.baseURI));
+}
+
 async function init() {
   try {
     const infoResponse = await fetch(modelInfoPath);
     modelInfo = await infoResponse.json();
+    modelPath = relativePath(
+      modelInfoPath,
+      modelInfo.modelfile.replace(".onnx", ".ort"),
+    ).toString();
+    modelTagPath = relativePath(modelInfoPath, modelInfo.tagsfile).toString();
     const tagsResponse = await fetch(modelTagPath);
     const tagsText = await tagsResponse.text();
     tags = parseCSV(tagsText);
