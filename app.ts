@@ -1,0 +1,297 @@
+import { InferenceSession, Tensor } from "onnxruntime-web";
+
+const modelPath = "/model/wd-v1-4-vit-tagger-v2/model.ort";
+const modelInfoPath = "/model/wd-v1-4-vit-tagger-v2/info.json";
+const modelTagPath = "/model/wd-v1-4-vit-tagger-v2/selected_tags.csv";
+
+const imageInput = getElementByIdOrDie("imageInput", HTMLInputElement);
+const uploadArea = getElementByIdOrDie("uploadArea", HTMLDivElement);
+const uploadButton = getElementByIdOrDie("uploadButton", HTMLButtonElement);
+const processButton = getElementByIdOrDie("processButton", HTMLButtonElement);
+const imagePreview = getElementByIdOrDie("imagePreview", HTMLImageElement);
+const thresholdInput = getElementByIdOrDie("threshold", HTMLInputElement);
+const loadingDiv = getElementByIdOrDie("loading", HTMLDivElement);
+const errorDiv = getElementByIdOrDie("error", HTMLDivElement);
+const resultsDiv = getElementByIdOrDie("results", HTMLDivElement);
+const ratingDiv = getElementByIdOrDie("ratingResult", HTMLDivElement);
+const tagsDiv = getElementByIdOrDie("tagsResult", HTMLDivElement);
+
+let modelSession: InferenceSession | null = null;
+let tags: Record<string, string>[] = [];
+let currentImage: HTMLImageElement | null = null;
+let modelInfo: ModelInfo;
+
+function parseCSV(text: string): Record<string, string>[] {
+  const lines = text.trim().split("\n");
+  const headers = lines[0].split(",");
+  const data: Record<string, string>[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(",");
+    const row: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      row[header] = values[index];
+    });
+    data.push(row);
+  }
+  return data;
+}
+
+async function init() {
+  try {
+    const infoResponse = await fetch(modelInfoPath);
+    modelInfo = await infoResponse.json();
+    const tagsResponse = await fetch(modelTagPath);
+    const tagsText = await tagsResponse.text();
+    tags = parseCSV(tagsText);
+    imageInput.addEventListener("change", handleImageSelect);
+    uploadButton.addEventListener("click", () => {
+      imageInput.click();
+    });
+    processButton.addEventListener("click", processImage);
+    uploadArea.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      uploadArea.classList.add("dragover");
+    });
+    uploadArea.addEventListener("dragleave", () => {
+      uploadArea.classList.remove("dragover");
+    });
+    uploadArea.addEventListener("drop", (e) => {
+      e.preventDefault();
+      uploadArea.classList.remove("dragover");
+      const files = e.dataTransfer?.files;
+      if (files && files.length > 0) {
+        handleImageFile(files[0]);
+      }
+    });
+  } catch (error) {
+    showError("Failed to initialize application: " + error.message);
+  }
+}
+
+function handleImageSelect() {
+  const file = imageInput.files?.[0];
+  if (file) {
+    handleImageFile(file);
+  }
+}
+
+function handleImageFile(file: File) {
+  if (!file.type.startsWith("image/")) {
+    showError("Please select a valid image file.");
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    if (!e.target || typeof e.target.result !== "string") {
+      return;
+    }
+    imagePreview.src = e.target.result;
+    imagePreview.style.display = "block";
+    currentImage = new Image();
+    currentImage.onload = () => {
+      processButton.disabled = false;
+    };
+    currentImage.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+async function loadModel() {
+  if (modelSession) {
+    return modelSession;
+  }
+  try {
+    const response = await fetch(modelPath);
+    if (!response.ok) {
+      throw new Error("ORT model not found");
+    }
+    console.log("Loading ORT model...");
+    modelSession = await InferenceSession.create(modelPath);
+    console.log("Model loaded successfully");
+    return modelSession;
+  } catch (error) {
+    throw new Error("Failed to load model: " + error.message);
+  }
+}
+
+function preprocessImage(image: HTMLImageElement, targetSize = 448) {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Unable to get 2D Canvas context.");
+  }
+  canvas.width = image.width;
+  canvas.height = image.height;
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(image, 0, 0);
+  let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const oldHeight = canvas.height;
+  const oldWidth = canvas.width;
+  const desiredSize = Math.max(oldWidth, oldHeight, targetSize);
+  const deltaW = desiredSize - oldWidth;
+  const deltaH = desiredSize - oldHeight;
+  const top = Math.floor(deltaH / 2);
+  const left = Math.floor(deltaW / 2);
+  const squareCanvas = document.createElement("canvas");
+  const squareCtx = squareCanvas.getContext("2d");
+  if (!squareCtx) {
+    throw new Error("Unable to get 2D Canvas context");
+  }
+  squareCanvas.width = desiredSize;
+  squareCanvas.height = desiredSize;
+  squareCtx.fillStyle = "white";
+  squareCtx.fillRect(0, 0, desiredSize, desiredSize);
+  squareCtx.drawImage(canvas, left, top);
+  const finalCanvas = document.createElement("canvas");
+  const finalCtx = finalCanvas.getContext("2d");
+  if (!finalCtx) {
+    throw new Error("Unable to get 2D Canvas context");
+  }
+  finalCanvas.width = targetSize;
+  finalCanvas.height = targetSize;
+  finalCtx.imageSmoothingEnabled = true;
+  finalCtx.imageSmoothingQuality = "high";
+  finalCtx.drawImage(squareCanvas, 0, 0, targetSize, targetSize);
+  imageData = finalCtx.getImageData(0, 0, targetSize, targetSize);
+  const data = imageData.data;
+  const tensor = new Float32Array(1 * targetSize * targetSize * 3);
+  for (let y = 0; y < targetSize; y++) {
+    for (let x = 0; x < targetSize; x++) {
+      const pixelIndex = (y * targetSize + x) * 4;
+      const tensorBaseIndex = (y * targetSize + x) * 3;
+      tensor[tensorBaseIndex] = data[pixelIndex + 2];
+      tensor[tensorBaseIndex + 1] = data[pixelIndex + 1];
+      tensor[tensorBaseIndex + 2] = data[pixelIndex];
+    }
+  }
+  return new Tensor("float32", tensor, [1, targetSize, targetSize, 3]);
+}
+
+async function processImage() {
+  if (!currentImage) {
+    showError("Please select an image first.");
+    return;
+  }
+  try {
+    showLoading(true);
+    hideResults();
+    hideError();
+    console.log("Loading model...");
+    const session = await loadModel();
+    console.log("Preprocessing image...");
+    const inputTensor = preprocessImage(currentImage);
+    console.log("Running inference...");
+    const feeds = {};
+    feeds[session.inputNames[0]] = inputTensor;
+    const results = await session.run(feeds);
+    const output = results[session.outputNames[0]];
+    const confidences = output.data;
+    const threshold = parseFloat(thresholdInput.value);
+    if (!(confidences instanceof Float32Array)) {
+      throw new Error(`Expected Float32Array for tensor output!`);
+    }
+    const { ratings, tagResults } = processResults(confidences, threshold);
+    displayResults(ratings, tagResults);
+  } catch (error) {
+    console.error("Processing error:", error);
+    showError("Failed to process image: " + error.message);
+  } finally {
+    showLoading(false);
+  }
+}
+
+function processResults(confidences: Float32Array, threshold: number) {
+  const ratings: Record<string, number> = {};
+  const tagResults: { name: string; confidence: number }[] = [];
+  const numRatings = modelInfo.numberofratings;
+  for (let i = 0; i < numRatings && i < tags.length; i++) {
+    const tag = tags[i];
+    ratings[tag.name] = confidences[i];
+  }
+  for (let i = numRatings; i < tags.length; i++) {
+    const tag = tags[i];
+    const confidence = confidences[i];
+    if (confidence > threshold) {
+      tagResults.push({
+        name: tag.name,
+        confidence: confidence,
+      });
+    }
+  }
+  tagResults.sort((a, b) => b.confidence - a.confidence);
+  return { ratings, tagResults };
+}
+
+function displayResults(
+  ratings: Record<string, number>,
+  tagResults: { name: string; confidence: number }[],
+) {
+  let topRating = "general";
+  let topRatingScore = 0;
+  for (const [name, score] of Object.entries(ratings)) {
+    if (score > topRatingScore) {
+      topRating = name;
+      topRatingScore = score;
+    }
+  }
+  ratingDiv.innerHTML = `
+    <strong>Content Rating:</strong> ${topRating}
+    <span style="color: #666;">(confidence: ${(topRatingScore * 100).toFixed(1)}%)</span>
+  `;
+  tagsDiv.innerHTML = "<h4>Tags:</h4>";
+  if (tagResults.length > 0) {
+    tagResults.forEach((tag) => {
+      const tagElement = document.createElement("span");
+      tagElement.className = "tag";
+      tagElement.textContent = `${tag.name} (${(tag.confidence * 100).toFixed(1)}%)`;
+      tagsDiv.appendChild(tagElement);
+    });
+  } else {
+    tagsDiv.innerHTML += "<p>No tags found above the threshold.</p>";
+  }
+  resultsDiv.style.display = "block";
+}
+
+function showLoading(show: boolean) {
+  loadingDiv.style.display = show ? "block" : "none";
+  processButton.disabled = show;
+}
+
+function hideResults() {
+  resultsDiv.style.display = "none";
+}
+
+function showError(message: string) {
+  errorDiv.textContent = message;
+  errorDiv.style.display = "block";
+}
+
+function hideError() {
+  errorDiv.style.display = "none";
+}
+
+function getElementByIdOrDie<T extends typeof HTMLElement>(
+  elementId: string,
+  cls: T,
+): InstanceType<T> {
+  const element = document.getElementById(elementId);
+  if (!element) {
+    throw new Error(`Missing expected element: #${elementId}`);
+  }
+  if (!(element instanceof cls)) {
+    throw new Error(`Element #${elementId} is not of type ${cls.name}`);
+  }
+  return element as unknown as InstanceType<T>;
+}
+
+interface ModelInfo {
+  modelname: string;
+  source: string;
+  modelfile: string;
+  tagsfile: string;
+  ratingsflag: number;
+  numberofratings: number;
+}
+
+window.addEventListener("load", init);
