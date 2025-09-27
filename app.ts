@@ -1,6 +1,9 @@
 import { InferenceSession, Tensor } from "onnxruntime-web";
 
-const modelInfoPath = "/model/wd-v1-4-vit-tagger-v2/info.json";
+const opfsSupported =
+  "storage" in navigator && "getDirectory" in navigator.storage;
+const modelInfoPath =
+  "https://models.hydrui.dev/wd-v1-4-vit-tagger-v2/info.json";
 let modelPath = "";
 let modelTagPath = "";
 
@@ -49,8 +52,7 @@ async function init() {
       modelInfo.modelfile.replace(".onnx", ".ort"),
     ).toString();
     modelTagPath = relativePath(modelInfoPath, modelInfo.tagsfile).toString();
-    const tagsResponse = await fetch(modelTagPath);
-    const tagsText = await tagsResponse.text();
+    const tagsText = await loadTagsWithCache();
     tags = parseCSV(tagsText);
     imageInput.addEventListener("change", handleImageSelect);
     uploadButton.addEventListener("click", () => {
@@ -110,12 +112,8 @@ async function loadModel() {
     return modelSession;
   }
   try {
-    const response = await fetch(modelPath);
-    if (!response.ok) {
-      throw new Error("ORT model not found");
-    }
     console.log("Loading ORT model...");
-    modelSession = await InferenceSession.create(modelPath);
+    modelSession = await InferenceSession.create(await loadModelWithCache());
     console.log("Model loaded successfully");
     return modelSession;
   } catch (error) {
@@ -292,6 +290,80 @@ function getElementByIdOrDie<T extends typeof HTMLElement>(
     throw new Error(`Element #${elementId} is not of type ${cls.name}`);
   }
   return element as unknown as InstanceType<T>;
+}
+
+async function getOPFSRoot() {
+  if (!opfsSupported) {
+    throw new Error("OPFS not supported");
+  }
+  return await navigator.storage.getDirectory();
+}
+
+async function getCacheKey(url: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(url);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .substring(0, 16);
+}
+
+async function loadModelWithCache(): Promise<ArrayBuffer> {
+  return (
+    await loadWithCache(modelPath, "model", "ort", "Model")
+  ).arrayBuffer();
+}
+
+async function loadTagsWithCache(): Promise<string> {
+  return (await loadWithCache(modelTagPath, "tags", "csv", "Tags")).text();
+}
+
+async function loadWithCache(
+  url: string,
+  cachePrefix: string,
+  fileExtension: string,
+  resourceName: string,
+): Promise<Blob> {
+  if (!opfsSupported) {
+    console.log(`OPFS not supported, fetching ${resourceName} directly`);
+    const response = await fetch(url);
+    return await response.blob();
+  }
+  try {
+    const root = await getOPFSRoot();
+    const cacheKey = await getCacheKey(url);
+    const fileName = `${cachePrefix}_${cacheKey}.${fileExtension}`;
+
+    try {
+      console.log(`Checking cache for ${resourceName}...`);
+      const fileHandle = await root.getFileHandle(fileName);
+      const file = await fileHandle.getFile();
+      console.log(`${resourceName} loaded from cache`);
+      return file;
+    } catch {
+      console.log(
+        `${resourceName} could not be loaded from cache, fetching from network...`,
+      );
+      const response = await fetch(url);
+      const blob = await response.blob();
+      try {
+        const fileHandle = await root.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        console.log(`${resourceName} cached successfully`);
+      } catch (writeError) {
+        console.warn(`Failed to cache ${resourceName}:`, writeError);
+      }
+      return blob;
+    }
+  } catch (error) {
+    console.warn(`Error in OPFS cache load:`, error);
+    const response = await fetch(url);
+    return await response.blob();
+  }
 }
 
 interface ModelInfo {
